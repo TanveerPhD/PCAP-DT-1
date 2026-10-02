@@ -1,0 +1,289 @@
+(* ============================================================ )
+( ProVerif 2.05 model: PQC/PUF PUV_i <-> CS_j/DGT_j protocol )
+( Corrected blockchain-bound UAV authentication model )
+( ============================================================ *)
+
+free c : channel.
+free bc : channel [private].
+
+(* ------------------------------------------------------------ )
+( 1. DATA CONSTRUCTORS )
+( ------------------------------------------------------------ *)
+
+fun pair(bitstring,bitstring) : bitstring.
+fun triple(bitstring,bitstring,bitstring) : bitstring.
+fun quad(bitstring,bitstring,bitstring,bitstring) : bitstring.
+
+(* ------------------------------------------------------------ )
+( 2. XOF )
+( ------------------------------------------------------------ *)
+
+fun XOF128(bitstring) : bitstring.
+fun XOF256(bitstring) : bitstring.
+
+(* ------------------------------------------------------------ )
+( 3. PUF / FUZZY EXTRACTOR )
+( ------------------------------------------------------------ *)
+
+fun PUF(bitstring) : bitstring [private].
+fun Rep(bitstring,bitstring) : bitstring.
+
+(* ------------------------------------------------------------ )
+( 4. POST-QUANTUM KEM )
+( ------------------------------------------------------------ *)
+
+type skey.
+type pkey.
+
+fun pk(skey) : pkey.
+fun kemK(pkey,bitstring) : bitstring.
+fun kemC(pkey,bitstring) : bitstring.
+fun Decaps(skey,bitstring) : bitstring.
+
+equation forall sk:skey, r:bitstring;
+Decaps(sk,kemC(pk(sk),r)) = kemK(pk(sk),r).
+
+(* ------------------------------------------------------------ )
+( 5. AUTHENTICATED ENCRYPTION )
+( ------------------------------------------------------------ *)
+
+(* aeadEnc symbolically represents ciphertext + authentication tag.
+aeadDec succeeds only with the correct key, AD, and IV. *)
+
+fun aeadEnc(bitstring,bitstring,bitstring,bitstring) : bitstring.
+
+reduc forall k:bitstring, ad:bitstring, iv:bitstring, m:bitstring;
+aeadDec(k,ad,iv,aeadEnc(k,ad,iv,m)) = m.
+
+(* ------------------------------------------------------------ )
+( 6. LONG-TERM / ENROLLED VALUES )
+( ------------------------------------------------------------ *)
+
+free IDi : bitstring [private].
+free IDj : bitstring.
+free SIDd : bitstring.
+free HDi : bitstring [private].
+free SKj : skey [private].
+
+(* sigmaEnroll abstracts the PUF-derived sigma_i established during
+the enrollment phase, which is not shown in the supplied protocol
+authentication figure. *)
+free sigmaEnroll : bitstring [private].
+
+(* Witnesses for ProVerif-2.05-compatible established-key secrecy tests. *)
+free serverKeyWitness : bitstring [private].
+free uavKeyWitness : bitstring [private].
+
+(* ------------------------------------------------------------ )
+( 7. EVENTS )
+( ------------------------------------------------------------ *)
+
+event UAV_M1(bitstring,bitstring,bitstring).
+event Server_Accept_M1(bitstring,bitstring,bitstring).
+
+event Server_Established(bitstring,bitstring,bitstring,bitstring).
+event UAV_Established(bitstring,bitstring,bitstring,bitstring).
+
+(* ------------------------------------------------------------ )
+( 8. REGISTRATION / BLOCKCHAIN RECORD )
+( ------------------------------------------------------------ *)
+
+(* The authentication figure assumes that a protected blockchain
+record already exists. This process models only that pre-existing
+enrollment state.
+
+Registered values:
+alpha_reg = XOF128(sigma_i)
+SIDi_reg = XOF128(alpha_reg || sigma_i)
+eki_reg = XOF128(alpha_reg || IDi || sigma_i)
+
+Blockchain record:
+Cb = AEAD_eki_reg{ AD = SIDi_reg, IV = SIDd, sigma_i }
+
+The private channel bc represents trusted blockchain lookup/storage.
+It is not the public network controlled by the DY adversary. *)
+
+let REGISTRATION =
+let alpha_reg = XOF128(sigmaEnroll) in
+let SIDi_reg = XOF128(pair(alpha_reg,sigmaEnroll)) in
+let eki_reg = XOF128(triple(alpha_reg,IDi,sigmaEnroll)) in
+
+let Cb =
+aeadEnc(eki_reg,SIDi_reg,SIDd,sigmaEnroll) in
+
+out(bc,(SIDi_reg,Cb)).
+
+(* ------------------------------------------------------------ )
+( 9. UAV / PHYSICAL DRONE PROCESS )
+( ------------------------------------------------------------ *)
+
+let UAV =
+(* Physical PUF evaluation is retained as part of the device model.
+The authentication phase uses the previously enrolled sigma_i. *)
+new Chi:bitstring;
+let Ri = PUF(Chi) in
+let sigma_check = Rep(Ri,HDi) in
+let sigmai = sigmaEnroll in
+
+let alpha = XOF128(sigmai) in
+let SIDi = XOF128(pair(alpha,sigmai)) in
+let eki = XOF128(triple(alpha,IDi,sigmai)) in
+
+(* PQC KEM encapsulation *)
+new kemRand:bitstring;
+let Kij = kemK(pk(SKj),kemRand) in
+let Cij = kemC(pk(SKj),kemRand) in
+
+(* Fresh authentication values *)
+new Rx:bitstring;
+new Tx:bitstring;
+
+let ADx = XOF128(pair(Tx,Cij)) in
+let IVx = XOF128(pair(ADx,Cij)) in
+
+let ptx = quad(SIDi,eki,Rx,SIDd) in
+
+(* CTx abstracts (Cx,Tagx). *)
+let CTx = aeadEnc(Kij,ADx,IVx,ptx) in
+
+event UAV_M1(SIDi,Rx,CTx);
+
+(* M1 = {Tx,Cx,Tagx,Cij} *)
+out(c,(Tx,CTx,Cij));
+
+(* M2 = {Cy,SKV,Tagy}; CTy abstracts (Cy,Tagy). *)
+in(c,(CTy:bitstring,SKV_recv:bitstring));
+
+let Ry1 = XOF128(pair(eki,Rx)) in
+let Rz1 = XOF128(pair(Kij,SIDi)) in
+let Sij = XOF256(quad(SIDi,SIDd,Ry1,Rz1)) in
+let SKV1 = XOF128(Sij) in
+
+if SKV_recv = SKV1 then
+let Ky1 = XOF256(pair(sigmai,Kij)) in
+
+(* Successful reduction models Tag_y verification. *)
+let received_pty =
+  aeadDec(Ky1,SKV1,Rx,CTy) in
+
+let expected_pty = quad(SIDi,eki,Rx,SIDd) in
+
+if received_pty = expected_pty then
+  event UAV_Established(SIDi,Rx,Sij,CTy);
+
+  (* ProVerif 2.05 secrecy witness:
+     disclosure requires an attacker-supplied exact Sij. *)
+  in(c,kGuessU:bitstring);
+  if kGuessU = Sij then
+    out(c,uavKeyWitness).
+(* ------------------------------------------------------------ )
+( 10. SERVER / DIGITAL-TWIN PROCESS )
+( ------------------------------------------------------------ *)
+
+let SERVER =
+in(c,(Tx:bitstring,CTx:bitstring,Cij:bitstring));
+
+(* Kij = Decaps(SKj,Cij) *)
+let Kij = Decaps(SKj,Cij) in
+
+let ADx_star = XOF128(pair(Tx,Cij)) in
+let IVx_star = XOF128(pair(ADx_star,Cij)) in
+
+(* Successful reduction models verification of Tag_x. *)
+let received_ptx =
+aeadDec(Kij,ADx_star,IVx_star,CTx) in
+
+let (SIDi:bitstring,
+eki:bitstring,
+Rx:bitstring,
+=SIDd) = received_ptx in
+
+(* ---------------------------------------------------------- )
+( BLOCKCHAIN VALIDATION )
+( ---------------------------------------------------------- *)
+
+(* Retrieve the record indexed by the received SIDi.
+Pattern =SIDi requires the stored SID to match exactly. *)
+in(bc,(=SIDi,Cb:bitstring));
+
+(* Crucial UAV-authentication check:
+the blockchain record was encrypted under the enrolled eki.
+Therefore this decryption succeeds only when the eki carried
+inside M1 is the registered eki associated with SIDi. *)
+let sigma_from_bc =
+aeadDec(eki,SIDi,SIDd,Cb) in
+
+(* Ensure the recovered enrollment secret is the registered sigma_i. *)
+if sigma_from_bc = sigmaEnroll then
+
+(* Only now does the server accept/authenticate M1. *)
+event Server_Accept_M1(SIDi,Rx,CTx);
+
+let sigmai = sigma_from_bc in
+
+let Ry = XOF128(pair(eki,Rx)) in
+let Rz = XOF128(pair(Kij,SIDi)) in
+let Sji = XOF256(quad(SIDi,SIDd,Ry,Rz)) in
+let SKV = XOF128(Sji) in
+
+let Ky = XOF256(pair(sigmai,Kij)) in
+
+(* Tuple abstraction of the protocol response plaintext. *)
+let pty = quad(SIDi,eki,Rx,SIDd) in
+
+(* ADy = SKV; IVy = Rx; CTy abstracts (Cy,Tagy). *)
+let CTy = aeadEnc(Ky,SKV,Rx,pty) in
+
+event Server_Established(SIDi,Rx,Sji,CTy);
+
+out(c,(CTy,SKV));
+
+(* ProVerif 2.05 secrecy witness:
+   disclosure requires an attacker-supplied exact Sji. *)
+in(c,kGuessS:bitstring);
+if kGuessS = Sji then
+  out(c,serverKeyWitness).
+(* ------------------------------------------------------------ )
+( 11. SECRECY QUERIES )
+( ------------------------------------------------------------ *)
+
+query attacker(IDi).
+query attacker(SKj).
+query attacker(sigmaEnroll).
+
+(* These should be false as reachability queries.
+Equivalently, the witnesses remain secret. *)
+query attacker(serverKeyWitness).
+query attacker(uavKeyWitness).
+
+(* ------------------------------------------------------------ )
+( 12. AUTHENTICATION / AGREEMENT QUERIES )
+( ------------------------------------------------------------ *)
+
+(* UAV authentication at server *)
+query sid:bitstring, rx:bitstring, m1:bitstring;
+event(Server_Accept_M1(sid,rx,m1))
+==> event(UAV_M1(sid,rx,m1)).
+
+(* Injective UAV authentication at server *)
+query sid:bitstring, rx:bitstring, m1:bitstring;
+inj-event(Server_Accept_M1(sid,rx,m1))
+==> inj-event(UAV_M1(sid,rx,m1)).
+
+(* Server authentication and session-key agreement at UAV *)
+query sid:bitstring, rx:bitstring, k:bitstring, m2:bitstring;
+event(UAV_Established(sid,rx,k,m2))
+==> event(Server_Established(sid,rx,k,m2)).
+
+(* Injective server authentication and key agreement *)
+query sid:bitstring, rx:bitstring, k:bitstring, m2:bitstring;
+inj-event(UAV_Established(sid,rx,k,m2))
+==> inj-event(Server_Established(sid,rx,k,m2)).
+
+(* ------------------------------------------------------------ )
+( 13. MAIN PROCESS )
+( ------------------------------------------------------------ *)
+
+process
+out(c,pk(SKj));
+(!REGISTRATION | !UAV | !SERVER)
